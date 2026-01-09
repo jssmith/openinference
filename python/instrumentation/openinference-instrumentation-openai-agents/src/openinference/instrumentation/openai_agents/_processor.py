@@ -38,7 +38,8 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_input_item_param import FunctionCallOutput, Message
 from openai.types.responses.response_output_message_param import Content
-from opentelemetry.context import attach, detach
+from opentelemetry.context import Context, attach, detach
+from opentelemetry import trace as otel_trace
 from opentelemetry.trace import Span as OtelSpan
 from opentelemetry.trace import (
     Status,
@@ -71,6 +72,7 @@ class OpenInferenceTracingProcessor(TracingProcessor):
     def __init__(self, tracer: Tracer) -> None:
         self._tracer = tracer
         self._root_spans: dict[str, OtelSpan] = {}
+        self._root_tokens: dict[str, object] = {}
         self._otel_spans: dict[str, OtelSpan] = {}
         self._tokens: dict[str, object] = {}
         # This captures in flight handoff. Once the handoff is complete, the entry is deleted
@@ -79,19 +81,43 @@ class OpenInferenceTracingProcessor(TracingProcessor):
         # in case there are large numbers of orphaned handoffs
         self._reverse_handoffs_dict: OrderedDict[str, str] = OrderedDict()
 
+    def _get_parent_context(self) -> Context | None:
+        """Get parent OTEL context for trace continuity.
+
+        Override this method to provide custom context propagation for
+        environments where standard OTEL context doesn't flow automatically
+        (e.g., sandboxed execution environments).
+
+        Returns:
+            OTEL Context with parent span, or None if no parent.
+        """
+        current_span = otel_trace.get_current_span()
+        if current_span:
+            parent_ctx = current_span.get_span_context()
+            if parent_ctx and parent_ctx.is_valid:
+                return set_span_in_context(current_span)
+        return None
+
     def on_trace_start(self, trace: Trace) -> None:
         """Called when a trace is started.
 
         Args:
             trace: The trace that started.
         """
+        # Use the hook method to get parent context (allows subclass override)
+        context = self._get_parent_context()
+
         otel_span = self._tracer.start_span(
             name=trace.name,
+            context=context,
             attributes={
                 OPENINFERENCE_SPAN_KIND: OpenInferenceSpanKindValues.AGENT.value,
             },
         )
         self._root_spans[trace.trace_id] = otel_span
+
+        # Attach span to context so downstream code can find it
+        self._root_tokens[trace.trace_id] = attach(set_span_in_context(otel_span))
 
     def on_trace_end(self, trace: Trace) -> None:
         """Called when a trace is finished.
@@ -99,6 +125,10 @@ class OpenInferenceTracingProcessor(TracingProcessor):
         Args:
             trace: The trace that started.
         """
+        # Detach the context token we attached in on_trace_start
+        if token := self._root_tokens.pop(trace.trace_id, None):
+            detach(token)  # type: ignore[arg-type]
+
         if root_span := self._root_spans.pop(trace.trace_id, None):
             root_span.set_status(Status(StatusCode.OK))
             root_span.end()
